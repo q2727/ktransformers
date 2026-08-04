@@ -11,6 +11,7 @@ node_modules
 *pycache*
 *build/
 .DS_Store
+.venv/
 compile_commands.json
 *.egg-info*
 *dist/
@@ -31,3 +32,4 @@ CMakeFiles/
 kvc2/
 sched/
 *.png
+experiments/artifacts/
