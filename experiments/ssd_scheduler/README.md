@@ -4,43 +4,50 @@ This directory runs a first functional Saguaro/SSD scheduler on one physical
 GPU with two resident CUDA clients:
 
 - KTransformers target: Qwen3-30B-A3B, MPS 82% (104 effective SMs).
-- SGLang draft: Qwen3-0.6B, MPS 18% (22 effective SMs).
+- Official SSD `DraftRunner`: Qwen3-0.6B, MPS 18% (22 effective SMs).
 - Default SSD parameters: draft length K=8, recovery fan-out F=1, and K+1
   target verification tokens. Set `SSD_DRAFT_LENGTH` and `SSD_FAN_OUT` at
-  launch time to change them; the draft CUDA Graph batch size follows K+1.
+  launch time to change them; the official tree graph follows the sum of the
+  K+1 per-position fan-outs.
 
-`start_ssd.sh` starts the MPS daemon, then the radix-cached draft server, then
-the target server. `stop_ssd.sh` only stops processes recorded in the run
-directory. The start script refuses to run when GPU 0 already has compute
-clients or either serving port is occupied.
+`start_ssd.sh` starts the MPS daemon, then the official SSD draft service, then
+the target server. The draft service is a separate CUDA client and uses a
+binary Unix-domain-socket protocol. Draft KV, outcome logits, and the tensor
+outcome cache never leave that process. `stop_ssd.sh` only stops processes
+recorded in the run directory. The start script refuses to run when the
+selected GPU already has compute clients or the target serving port is
+occupied.
 
 Batch-invariant deterministic inference is enabled by default for the target,
-where it stabilizes prefill and tree verification. It is disabled for the
-draft because speculative correctness does not depend on draft numerics and
-the batch-invariant kernels are much slower for the 9-branch workload. Override
-these independently with `TARGET_DETERMINISTIC_INFERENCE` and
-`DRAFT_DETERMINISTIC_INFERENCE`.
+where it stabilizes prefill and tree verification. The official draft engine
+uses its own greedy sampler and CUDA graphs. `DRAFT_DETERMINISTIC_INFERENCE`
+only applies when `SSD_DRAFT_BACKEND=sglang`.
 
-The target-side worker implements the SSD state machine used by the reference
-implementation:
+The target-side worker and official drafter implement the SSD state machine:
 
 1. Look up the next draft by `(accepted_draft_count, recovery_token)`.
-2. Fall back to an ordinary K-token draft on a miss.
-3. Carry the K+1 endpoint distributions returned with every cached draft,
-   select F off-path recovery tokens per endpoint, and submit all next branches
-   in one asynchronous RPC before target verification.
+2. Run the official drafter's in-place JIT path on a miss.
+3. Run the official glue decode and branch-tree CUDA graphs on its paged KV;
+   retain all `(request, accepted_length, recovery_token)` entries GPU-side.
 4. Verify the current linear path with SGLang's target-only tree verifier while
-   the independent draft process builds those next-round branches.
+   that independent official SSD process builds the next outcome tree.
 
-The draft server's radix cache supplies shared-prefix and copy-on-write KV
-reuse across the branch batch. Generating one extra draft token materializes
-the full K-token path KV and returns the final endpoint distribution, avoiding
-a separate endpoint-query batch. Target verification remains the source of
-truth.
+The canonical path does not require branch-KV copying. Official SSD's glue
+decode writes the current recovery plus K-token path into canonical paged-KV
+positions; the outcome tree uses separate lookahead slots. The next SELECT
+either reads the matching tensor-cache entry or repairs the same canonical KV
+with JIT. Target verification remains the source of truth.
 
 Current implementation boundary: one active greedy text request, no grammar,
-TP=1, and prompts no longer than one 2048-token prefill chunk. K and F are CLI
+TP=1, and one official draft session. K and per-position fan-out are CLI
 configurable, although the provided launch point is K=8/F=1.
+
+Initialize the pinned official engine once:
+
+```bash
+git submodule update --init third_party/ssd
+cd third_party/ssd && uv sync --frozen && cd ../..
+```
 
 Example:
 
@@ -50,6 +57,9 @@ python experiments/ssd_scheduler/benchmark.py \
   --label ssd --output experiments/artifacts/ssd-scheduler/ssd.json
 experiments/ssd_scheduler/stop_ssd.sh
 ```
+
+The official engine is the default. To retain the previous generic SGLang
+draft server for A/B comparisons, launch with `SSD_DRAFT_BACKEND=sglang`.
 
 For the K=5/F=1 comparison, launch SSD with:
 
@@ -78,4 +88,8 @@ decode can still choose different greedy tokens because the offloaded CPU-MoE
 GEMMs use different M=9 and M=1 numerical paths; the batch-invariant SGLang
 mode does not cover the external CPU kernel. The existing `STANDALONE` path is
 therefore the relevant scheduler integration reference, while ordinary-decode
-equivalence remains a separate KT kernel issue.
+equivalence remains a separate KT kernel issue. In the first official-engine
+gate, F=1 and F=4 both matched the legacy SSD path for 128/128 tokens. At K=5
+and a 50/50 MPS split, F=4 built 24-branch outcome trees in about 21 ms and
+increased cache hits from 19/53 to 37/53 on that request; end-to-end latency
+fell from 4.04 s to 3.25 s.

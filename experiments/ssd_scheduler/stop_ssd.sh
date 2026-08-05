@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-REPO_ROOT="${REPO_ROOT:-/home/qinchong/workspace/code/ktransformers}"
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO_ROOT="${REPO_ROOT:-$(cd -- "${SCRIPT_DIR}/../.." && pwd)}"
 OUT_DIR="${OUT_DIR:-${REPO_ROOT}/experiments/artifacts/ssd-scheduler}"
 RUN_DIR="${OUT_DIR}/run"
-MPS_PIPE_DIR="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/qinchong-mps-pipe}"
-MPS_LOG_DIR="${CUDA_MPS_LOG_DIRECTORY:-/tmp/qinchong-mps-log}"
+GPU_ID="${GPU_ID:-0}"
+SSD_DRAFT_SOCKET="${SSD_DRAFT_SOCKET:-/tmp/ktransformers-ssd-${USER}-gpu${GPU_ID}.sock}"
+MPS_PIPE_DIR="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/qinchong-mps-gpu${GPU_ID}-pipe}"
+MPS_LOG_DIR="${CUDA_MPS_LOG_DIRECTORY:-/tmp/qinchong-mps-gpu${GPU_ID}-log}"
 
 for name in target draft; do
   pid_file="${RUN_DIR}/${name}.pid"
@@ -21,6 +24,7 @@ for name in target draft; do
   fi
   rm -f "${pid_file}"
 done
+rm -f "${SSD_DRAFT_SOCKET}"
 
 export CUDA_MPS_PIPE_DIRECTORY="${MPS_PIPE_DIR}"
 export CUDA_MPS_LOG_DIRECTORY="${MPS_LOG_DIR}"
