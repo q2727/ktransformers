@@ -243,6 +243,60 @@ class OfficialSSDDraftEngine:
             cache_hits[0].item()
         )
 
+    @torch.inference_mode()
+    def _commit_full_accept_tail(
+        self, session: DraftSession, num_tokens: int
+    ) -> None:
+        """Write the final accepted draft token into persistent draft KV.
+
+        ``jit_speculate`` runs K decode steps starting with the recovery token.
+        It therefore writes the recovery token and draft tokens 0..K-2, while
+        draft token K-1 is returned from logits but is not itself decoded.  The
+        normal SSD BUILD/glue path writes that tail token speculatively.  A
+        no-outcome-cache sequential-SD run skips BUILD, so a full K-token
+        acceptance must commit the missing tail before decoding the new target
+        recovery token.
+        """
+        if len(session.current_candidate) != self.draft_length:
+            raise RuntimeError(
+                "Cannot commit a full-accept tail without a complete candidate."
+            )
+        position_value = num_tokens - 2
+        if position_value < 0:
+            raise RuntimeError("Full-accept tail position is negative.")
+
+        positions = torch.tensor(
+            [position_value], dtype=torch.int64, device=self.device
+        )
+        block_indices = positions // self.block_size
+        offsets = positions % self.block_size
+        slot_mapping = (
+            session.block_table[0, block_indices] * self.block_size + offsets
+        ).to(torch.int32)
+        context_lens = torch.tensor(
+            [position_value + 1], dtype=torch.int32, device=self.device
+        )
+        set_context(
+            is_prefill=False,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=session.block_table,
+            is_jit=True,
+        )
+        try:
+            self.runner.run_model(
+                torch.tensor(
+                    [session.current_candidate[-1]],
+                    dtype=torch.int64,
+                    device=self.device,
+                ),
+                positions,
+                is_prefill=False,
+                last_only=True,
+            )
+        finally:
+            reset_context()
+
     def init(self, rid: str, prefix: list[int]) -> tuple[list[int], bool, float]:
         if len(prefix) < 2:
             raise ValueError("INIT prefix must contain prompt plus recovery token.")
@@ -320,6 +374,8 @@ class OfficialSSDDraftEngine:
         num_tokens: int,
         accepted_length: int,
         recovery_token: int,
+        *,
+        force_miss: bool = False,
     ) -> tuple[list[int], bool, float]:
         session = self._require_session(rid)
         if not 0 <= accepted_length <= self.draft_length:
@@ -338,6 +394,10 @@ class OfficialSSDDraftEngine:
             )
 
         begin = time.perf_counter()
+        if force_miss:
+            self.runner._reset_tree_cache_tensors()
+            if accepted_length == self.draft_length:
+                self._commit_full_accept_tail(session, num_tokens)
         candidate, cache_hit = self._select_or_jit_candidate(
             session,
             accepted_length=accepted_length,
@@ -349,13 +409,16 @@ class OfficialSSDDraftEngine:
         session.current_cache_hit = cache_hit
         elapsed_ms = (time.perf_counter() - begin) * 1e3
         logger.info(
-            "SELECT rid=%s k=%d recovery=%d cache_hit=%s elapsed_ms=%.3f",
+            "%s rid=%s k=%d recovery=%d cache_hit=%s elapsed_ms=%.3f",
+            "ADVANCE_JIT" if force_miss else "SELECT",
             rid,
             accepted_length,
             recovery_token,
             cache_hit,
             elapsed_ms,
         )
+        if force_miss and cache_hit:
+            raise RuntimeError("ADVANCE_JIT unexpectedly hit an outcome cache entry.")
         return candidate, cache_hit, elapsed_ms
 
     @torch.inference_mode()
@@ -509,6 +572,20 @@ class OfficialSSDServer:
             reader.finish()
             candidate, cache_hit, elapsed_ms = self.engine.select(
                 rid, num_tokens, accepted_length, recovery_token
+            )
+            return self._candidate_payload(candidate, cache_hit, elapsed_ms)
+        if op == OfficialSSDOp.ADVANCE_JIT:
+            rid = reader.text()
+            num_tokens = reader.i64()
+            accepted_length = reader.i32()
+            recovery_token = reader.i32()
+            reader.finish()
+            candidate, cache_hit, elapsed_ms = self.engine.select(
+                rid,
+                num_tokens,
+                accepted_length,
+                recovery_token,
+                force_miss=True,
             )
             return self._candidate_payload(candidate, cache_hit, elapsed_ms)
         if op == OfficialSSDOp.BUILD:
