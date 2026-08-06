@@ -11,6 +11,8 @@ TARGET_FP8_GEMM_BACKEND="${TARGET_FP8_GEMM_BACKEND:-}"
 TARGET_MEM_FRACTION_STATIC="${TARGET_MEM_FRACTION_STATIC:-0.65}"
 TARGET_MAX_TOTAL_TOKENS="${TARGET_MAX_TOTAL_TOKENS:-32768}"
 TARGET_CHUNKED_PREFILL_SIZE="${TARGET_CHUNKED_PREFILL_SIZE:-2048}"
+TARGET_READY_TIMEOUT="${TARGET_READY_TIMEOUT:-180}"
+DRAFT_READY_TIMEOUT="${DRAFT_READY_TIMEOUT:-300}"
 TARGET_PORT="${TARGET_PORT:-30020}"
 DRAFT_PORT="${DRAFT_PORT:-30021}"
 SSD_DRAFT_BACKEND="${SSD_DRAFT_BACKEND:-official}"
@@ -190,8 +192,8 @@ stop_started_processes() {
 trap stop_started_processes ERR INT TERM
 
 wait_until_ready() {
-  local port=$1 pid=$2 log=$3
-  for _ in $(seq 1 180); do
+  local port=$1 pid=$2 log=$3 attempts=$4
+  for _ in $(seq 1 "${attempts}"); do
     if curl -fsS "http://127.0.0.1:${port}/model_info" >/dev/null 2>&1; then
       return 0
     fi
@@ -206,8 +208,8 @@ wait_until_ready() {
 }
 
 wait_until_socket_ready() {
-  local socket_path=$1 pid=$2 log=$3
-  for _ in $(seq 1 300); do
+  local socket_path=$1 pid=$2 log=$3 attempts=$4
+  for _ in $(seq 1 "${attempts}"); do
     if [[ -S "${socket_path}" ]]; then
       return 0
     fi
@@ -270,9 +272,11 @@ fi
 DRAFT_PID=$!
 echo "${DRAFT_PID}" >"${RUN_DIR}/draft.pid"
 if [[ "${SSD_DRAFT_BACKEND}" == "official" ]]; then
-  wait_until_socket_ready "${SSD_DRAFT_SOCKET}" "${DRAFT_PID}" "${DRAFT_LOG}"
+  wait_until_socket_ready \
+    "${SSD_DRAFT_SOCKET}" "${DRAFT_PID}" "${DRAFT_LOG}" "${DRAFT_READY_TIMEOUT}"
 else
-  wait_until_ready "${DRAFT_PORT}" "${DRAFT_PID}" "${DRAFT_LOG}"
+  wait_until_ready \
+    "${DRAFT_PORT}" "${DRAFT_PID}" "${DRAFT_LOG}" "${DRAFT_READY_TIMEOUT}"
 fi
 
 TARGET_LOG="${LOG_DIR}/target.log"
@@ -305,7 +309,8 @@ env "${TARGET_MPS_ENV[@]}" setsid \
     >"${TARGET_LOG}" 2>&1 < /dev/null &
 TARGET_PID=$!
 echo "${TARGET_PID}" >"${RUN_DIR}/target.pid"
-wait_until_ready "${TARGET_PORT}" "${TARGET_PID}" "${TARGET_LOG}"
+wait_until_ready \
+  "${TARGET_PORT}" "${TARGET_PID}" "${TARGET_LOG}" "${TARGET_READY_TIMEOUT}"
 
 trap - ERR INT TERM
 echo "SSD ready on GPU ${GPU_ID}: target=http://127.0.0.1:${TARGET_PORT} (${TARGET_MPS_PERCENT}%), draft=${SSD_DRAFT_SERVER_URL} (${DRAFT_MPS_PERCENT}%)"
