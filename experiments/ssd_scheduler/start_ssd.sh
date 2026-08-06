@@ -5,6 +5,12 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT="${REPO_ROOT:-$(cd -- "${SCRIPT_DIR}/../.." && pwd)}"
 TARGET_MODEL="${TARGET_MODEL:-/data/qinchong/models/MoE-SpAc/Qwen3-30B-A3B}"
 DRAFT_MODEL="${DRAFT_MODEL:-/data/qinchong/models/MoE-SpAc/Qwen3-0.6B}"
+TARGET_SERVED_MODEL_NAME="${TARGET_SERVED_MODEL_NAME:-$(basename -- "${TARGET_MODEL}")-SSD}"
+TARGET_KT_METHOD="${TARGET_KT_METHOD:-BF16}"
+TARGET_FP8_GEMM_BACKEND="${TARGET_FP8_GEMM_BACKEND:-}"
+TARGET_MEM_FRACTION_STATIC="${TARGET_MEM_FRACTION_STATIC:-0.65}"
+TARGET_MAX_TOTAL_TOKENS="${TARGET_MAX_TOTAL_TOKENS:-32768}"
+TARGET_CHUNKED_PREFILL_SIZE="${TARGET_CHUNKED_PREFILL_SIZE:-2048}"
 TARGET_PORT="${TARGET_PORT:-30020}"
 DRAFT_PORT="${DRAFT_PORT:-30021}"
 SSD_DRAFT_BACKEND="${SSD_DRAFT_BACKEND:-official}"
@@ -92,6 +98,7 @@ export SGLANG_SSD_DRAFT_SIDE_CACHE="${SSD_DRAFT_SIDE_CACHE}"
 export SGLANG_SSD_DISABLE_OUTCOME_CACHE="${SSD_DISABLE_OUTCOME_CACHE}"
 
 TARGET_DETERMINISTIC_ARGS=()
+TARGET_PRECISION_ARGS=()
 DRAFT_DETERMINISTIC_ARGS=()
 DRAFT_TOKENIZER_ARGS=()
 DRAFT_SCHEDULER_ARGS=(
@@ -102,6 +109,9 @@ SSD_FAN_OUT_VALUES=()
 SSD_BRANCH_BATCH=$((SSD_VERIFY_TOKENS * SSD_FAN_OUT))
 if [[ "${TARGET_DETERMINISTIC_INFERENCE}" == "1" ]]; then
   TARGET_DETERMINISTIC_ARGS+=(--enable-deterministic-inference)
+fi
+if [[ -n "${TARGET_FP8_GEMM_BACKEND}" ]]; then
+  TARGET_PRECISION_ARGS+=(--fp8-gemm-backend "${TARGET_FP8_GEMM_BACKEND}")
 fi
 if [[ "${DRAFT_DETERMINISTIC_INFERENCE}" == "1" ]]; then
   DRAFT_DETERMINISTIC_ARGS+=(--enable-deterministic-inference)
@@ -275,16 +285,17 @@ fi
 env "${TARGET_MPS_ENV[@]}" setsid \
   "${TARGET_PROFILE_PREFIX[@]}" python -m sglang.launch_server \
     --host 127.0.0.1 --port "${TARGET_PORT}" \
-    --model "${TARGET_MODEL}" --served-model-name Qwen3-30B-A3B-SSD \
-    --kt-weight-path "${TARGET_MODEL}" --kt-method BF16 \
+    --model "${TARGET_MODEL}" --served-model-name "${TARGET_SERVED_MODEL_NAME}" \
+    --kt-weight-path "${TARGET_MODEL}" --kt-method "${TARGET_KT_METHOD}" \
     --kt-num-gpu-experts 0 --kt-cpuinfer 120 --kt-threadpool-count 2 \
     --kt-numa-nodes 0 1 --kt-gpu-prefill-token-threshold 2048 \
     --tensor-parallel-size 1 --attention-backend triton \
-    --max-total-tokens 32768 --max-running-requests 2 \
-    --chunked-prefill-size 2048 --mem-fraction-static 0.65 \
+    --max-total-tokens "${TARGET_MAX_TOTAL_TOKENS}" --max-running-requests 2 \
+    --chunked-prefill-size "${TARGET_CHUNKED_PREFILL_SIZE}" \
+    --mem-fraction-static "${TARGET_MEM_FRACTION_STATIC}" \
     --watchdog-timeout 3000 --disable-shared-experts-fusion \
     --trust-remote-code --enable-p2p-check --disable-custom-all-reduce \
-    "${TARGET_DETERMINISTIC_ARGS[@]}" \
+    "${TARGET_DETERMINISTIC_ARGS[@]}" "${TARGET_PRECISION_ARGS[@]}" \
     --reasoning-parser qwen3 --cuda-graph-max-bs 1 --cuda-graph-bs 1 \
     --speculative-algorithm SSD \
     --speculative-num-steps "${SSD_DRAFT_LENGTH}" --speculative-eagle-topk 1 \
