@@ -11,7 +11,11 @@ SSD_DRAFT_BACKEND="${SSD_DRAFT_BACKEND:-official}"
 SSD_OFFICIAL_ROOT="${SSD_OFFICIAL_ROOT:-${REPO_ROOT}/third_party/ssd}"
 SSD_OFFICIAL_PYTHON="${SSD_OFFICIAL_PYTHON:-${SSD_OFFICIAL_ROOT}/.venv/bin/python}"
 SSD_DRAFT_MAX_MODEL_LEN="${SSD_DRAFT_MAX_MODEL_LEN:-8192}"
-SSD_DRAFT_GPU_MEMORY_UTILIZATION="${SSD_DRAFT_GPU_MEMORY_UTILIZATION:-0.20}"
+# B=1 with the default 2048-token context needs only eight 256-token KV
+# blocks. Two percent leaves ample headroom (30 blocks for Qwen3-1.7B on the
+# tested 48-GiB device) without reserving memory for dozens of unsupported
+# concurrent requests. Increase this explicitly for longer contexts/models.
+SSD_DRAFT_GPU_MEMORY_UTILIZATION="${SSD_DRAFT_GPU_MEMORY_UTILIZATION:-0.02}"
 GPU_ID="${GPU_ID:-0}"
 TARGET_MPS_PERCENT="${TARGET_MPS_PERCENT:-82}"
 DRAFT_MPS_PERCENT="${DRAFT_MPS_PERCENT:-18}"

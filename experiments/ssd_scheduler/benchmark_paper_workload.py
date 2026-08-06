@@ -74,6 +74,11 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--max-input-tokens", type=int, default=2048)
     parser.add_argument("--timeout", type=float, default=1200.0)
+    parser.add_argument(
+        "--gpu-index",
+        type=int,
+        help="Physical NVML GPU index for total-energy measurement",
+    )
     parser.add_argument("--label", required=True)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -85,6 +90,18 @@ def main() -> None:
 
     latencies = []
     total_tokens = 0
+    energy_handle = None
+    energy_start_mj = None
+    energy_begin = None
+    if args.gpu_index is not None:
+        import pynvml
+
+        pynvml.nvmlInit()
+        energy_handle = pynvml.nvmlDeviceGetHandleByIndex(args.gpu_index)
+        energy_start_mj = pynvml.nvmlDeviceGetTotalEnergyConsumption(
+            energy_handle
+        )
+        energy_begin = time.perf_counter()
     with args.output.open("a") as output_file:
         for ordinal, prompt in enumerate(prompts):
             input_ids = tokenizer.encode(prompt["text"], add_special_tokens=False)
@@ -116,6 +133,19 @@ def main() -> None:
                 flush=True,
             )
 
+    energy_summary = {}
+    if energy_handle is not None:
+        energy_elapsed_s = time.perf_counter() - energy_begin
+        energy_end_mj = pynvml.nvmlDeviceGetTotalEnergyConsumption(energy_handle)
+        energy_j = (energy_end_mj - energy_start_mj) / 1e3
+        energy_summary = {
+            "gpu_energy_j": energy_j,
+            "gpu_energy_elapsed_s": energy_elapsed_s,
+            "gpu_average_power_w": energy_j / energy_elapsed_s,
+            "gpu_j_per_output_token": energy_j / total_tokens,
+        }
+        pynvml.nvmlShutdown()
+
     summary = {
         "label": args.label,
         "requests": len(prompts),
@@ -125,6 +155,7 @@ def main() -> None:
         "latency_mean_s": statistics.fmean(latencies),
         "latency_median_s": statistics.median(latencies),
         "throughput_tok_s": total_tokens / sum(latencies),
+        **energy_summary,
     }
     summary_path = args.output.with_suffix(args.output.suffix + ".summary.json")
     summary_path.write_text(json.dumps(summary, indent=2) + "\n")

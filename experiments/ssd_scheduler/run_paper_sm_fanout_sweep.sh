@@ -14,6 +14,7 @@ MAX_NEW_TOKENS="${MAX_NEW_TOKENS:-128}"
 SSD_DRAFT_LENGTH="${SSD_DRAFT_LENGTH:-5}"
 SSD_DRAFT_BACKEND="${SSD_DRAFT_BACKEND:-official}"
 SSD_DRAFT_MAX_MODEL_LEN="${SSD_DRAFT_MAX_MODEL_LEN:-2048}"
+MEASURE_GPU_ENERGY="${MEASURE_GPU_ENERGY:-0}"
 
 # Approximately (target SM, draft SM) = (104,22), (96,32), (64,64)
 # on the 128-SM RTX 4090. MPS percentages are the actual control values.
@@ -59,15 +60,32 @@ for split in "${SPLITS[@]}"; do
     OUT_DIR="${CURRENT_OUT}" \
       experiments/ssd_scheduler/start_ssd.sh | tee "${CURRENT_OUT}/start.stdout"
 
+    ENERGY_ARGS=()
+    if [[ "${MEASURE_GPU_ENERGY}" == "1" ]]; then
+      ENERGY_ARGS+=(--gpu-index "${GPU_ID}")
+      nvidia-smi -i "${GPU_ID}" \
+        --query-compute-apps=pid,process_name,used_gpu_memory \
+        --format=csv,noheader,nounits \
+        >"${CURRENT_OUT}/gpu_process_memory_ready.csv"
+    fi
+
     python experiments/ssd_scheduler/benchmark_paper_workload.py \
       --url "http://127.0.0.1:${TARGET_PORT}" \
       --model "${TARGET_MODEL}" \
       --dataset-dir "${DATASET_DIR}" \
       --num-per-dataset "${NUM_PER_DATASET}" \
       --max-new-tokens "${MAX_NEW_TOKENS}" \
+      "${ENERGY_ARGS[@]}" \
       --label "${label}" \
       --output "${CURRENT_OUT}/records.jsonl" \
       | tee "${CURRENT_OUT}/benchmark.stdout"
+
+    if [[ "${MEASURE_GPU_ENERGY}" == "1" ]]; then
+      nvidia-smi -i "${GPU_ID}" \
+        --query-compute-apps=pid,process_name,used_gpu_memory \
+        --format=csv,noheader,nounits \
+        >"${CURRENT_OUT}/gpu_process_memory_post.csv"
+    fi
 
     # Let the final asynchronously submitted cache build finish and emit timing.
     sleep 1
