@@ -16,6 +16,7 @@ import signal
 import socket
 import time
 import traceback
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import patch
@@ -43,6 +44,13 @@ from ssd.utils.context import reset_context, set_context
 
 
 logger = logging.getLogger("official-ssd-draft")
+
+
+def _draft_profile_range():
+    control = os.environ.get("SSD_DRAFT_PROFILE_CONTROL")
+    if control and not Path(control).exists():
+        return nullcontext()
+    return torch.cuda.nvtx.range("official_ssd_profile_draft_call")
 
 
 class ColocatedDraftRunner(DraftRunner):
@@ -556,13 +564,15 @@ class OfficialSSDServer:
             rid = reader.text()
             prefix = reader.int_list()
             reader.finish()
-            candidate, cache_hit, elapsed_ms = self.engine.init(rid, prefix)
+            with _draft_profile_range():
+                candidate, cache_hit, elapsed_ms = self.engine.init(rid, prefix)
             return self._candidate_payload(candidate, cache_hit, elapsed_ms)
         if op == OfficialSSDOp.JIT:
             rid = reader.text()
             prefix = reader.int_list()
             reader.finish()
-            candidate, cache_hit, elapsed_ms = self.engine.jit(rid, prefix)
+            with _draft_profile_range():
+                candidate, cache_hit, elapsed_ms = self.engine.jit(rid, prefix)
             return self._candidate_payload(candidate, cache_hit, elapsed_ms)
         if op == OfficialSSDOp.SELECT:
             rid = reader.text()
@@ -580,13 +590,14 @@ class OfficialSSDServer:
             accepted_length = reader.i32()
             recovery_token = reader.i32()
             reader.finish()
-            candidate, cache_hit, elapsed_ms = self.engine.select(
-                rid,
-                num_tokens,
-                accepted_length,
-                recovery_token,
-                force_miss=True,
-            )
+            with _draft_profile_range():
+                candidate, cache_hit, elapsed_ms = self.engine.select(
+                    rid,
+                    num_tokens,
+                    accepted_length,
+                    recovery_token,
+                    force_miss=True,
+                )
             return self._candidate_payload(candidate, cache_hit, elapsed_ms)
         if op == OfficialSSDOp.BUILD:
             rid = reader.text()
