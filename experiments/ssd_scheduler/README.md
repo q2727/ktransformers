@@ -10,13 +10,13 @@ GPU with two resident CUDA clients:
   launch time to change them; the official tree graph follows the sum of the
   K+1 per-position fan-outs.
 
-`start_ssd.sh` starts the MPS daemon, then the official SSD draft service, then
-the target server. The draft service is a separate CUDA client and uses a
-binary Unix-domain-socket protocol. Draft KV, outcome logits, and the tensor
-outcome cache never leave that process. `stop_ssd.sh` only stops processes
-recorded in the run directory. The start script refuses to run when the
-selected GPU already has compute clients or the target serving port is
-occupied.
+`start_ssd.sh` starts the MPS daemon, then the selected draft service, then the
+target server. `SSD_DRAFT_BACKEND=auto` uses the official SSD `DraftRunner` for
+Qwen3/Llama and the SGLang draft backend for model families that the official
+engine does not implement, including Qwen3.5. Both backends run as a separate
+CUDA client. `stop_ssd.sh` only stops processes recorded in the run directory.
+The start script refuses to run when the selected GPU already has compute
+clients or the target serving port is occupied.
 
 Batch-invariant deterministic inference is enabled by default for the target,
 where it stabilizes prefill and tree verification. The official draft engine
@@ -58,8 +58,25 @@ python experiments/ssd_scheduler/benchmark.py \
 experiments/ssd_scheduler/stop_ssd.sh
 ```
 
-The official engine is the default. To retain the previous generic SGLang
-draft server for A/B comparisons, launch with `SSD_DRAFT_BACKEND=sglang`.
+The default `auto` backend can be overridden with
+`SSD_DRAFT_BACKEND=official` or `SSD_DRAFT_BACKEND=sglang`. The official
+backend rejects Qwen3.5 explicitly because its `DraftRunner` has no Gated
+DeltaNet implementation.
+
+Qwen3.5 example:
+
+```bash
+TARGET_MODEL=/models/Qwen3.6-35B-A3B \
+DRAFT_MODEL=/models/Qwen3.5-0.8B \
+SSD_DRAFT_LENGTH=7 SSD_FAN_OUT=4 \
+TARGET_MPS_PERCENT=75 DRAFT_MPS_PERCENT=25 \
+experiments/ssd_scheduler/start_ssd.sh
+```
+
+Qwen3.5 uses SGLang's hybrid Gated DeltaNet state cache and one continuous
+decode step per scheduler iteration. SSD is text-only, so the launcher also
+skips SGLang's built-in image warmup for Qwen3.5-family targets; the first
+text request warms that path instead.
 
 For the K=5/F=1 comparison, launch SSD with:
 

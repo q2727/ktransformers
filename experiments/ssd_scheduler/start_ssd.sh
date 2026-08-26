@@ -5,6 +5,7 @@ SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT="${REPO_ROOT:-$(cd -- "${SCRIPT_DIR}/../.." && pwd)}"
 TARGET_MODEL="${TARGET_MODEL:-/data/qinchong/models/MoE-SpAc/Qwen3-30B-A3B}"
 DRAFT_MODEL="${DRAFT_MODEL:-/data/qinchong/models/MoE-SpAc/Qwen3-0.6B}"
+DRAFT_SERVED_MODEL_NAME="${DRAFT_SERVED_MODEL_NAME:-$(basename -- "${DRAFT_MODEL}")-SSD}"
 TARGET_SERVED_MODEL_NAME="${TARGET_SERVED_MODEL_NAME:-$(basename -- "${TARGET_MODEL}")-SSD}"
 TARGET_KT_METHOD="${TARGET_KT_METHOD:-BF16}"
 TARGET_FP8_GEMM_BACKEND="${TARGET_FP8_GEMM_BACKEND:-}"
@@ -15,7 +16,7 @@ TARGET_READY_TIMEOUT="${TARGET_READY_TIMEOUT:-180}"
 DRAFT_READY_TIMEOUT="${DRAFT_READY_TIMEOUT:-300}"
 TARGET_PORT="${TARGET_PORT:-30020}"
 DRAFT_PORT="${DRAFT_PORT:-30021}"
-SSD_DRAFT_BACKEND="${SSD_DRAFT_BACKEND:-official}"
+SSD_DRAFT_BACKEND="${SSD_DRAFT_BACKEND:-auto}"
 SSD_OFFICIAL_ROOT="${SSD_OFFICIAL_ROOT:-${REPO_ROOT}/third_party/ssd}"
 SSD_OFFICIAL_PYTHON="${SSD_OFFICIAL_PYTHON:-${SSD_OFFICIAL_ROOT}/.venv/bin/python}"
 SSD_DRAFT_MAX_MODEL_LEN="${SSD_DRAFT_MAX_MODEL_LEN:-8192}"
@@ -55,13 +56,57 @@ if (( SSD_DRAFT_LENGTH < 1 )); then
   echo "SSD_DRAFT_LENGTH must be at least 1." >&2
   exit 1
 fi
+if [[ ! -r "${DRAFT_MODEL}/config.json" ]]; then
+  echo "Draft model config not found: ${DRAFT_MODEL}/config.json" >&2
+  exit 1
+fi
+if [[ ! -r "${TARGET_MODEL}/config.json" ]]; then
+  echo "Target model config not found: ${TARGET_MODEL}/config.json" >&2
+  exit 1
+fi
+TARGET_MODEL_TYPE=$(jq -r \
+  '.text_config.model_type // .model_type // empty' \
+  "${TARGET_MODEL}/config.json")
+DRAFT_MODEL_TYPE=$(jq -r \
+  '.text_config.model_type // .model_type // empty' \
+  "${DRAFT_MODEL}/config.json")
+if [[ -z "${TARGET_MODEL_TYPE}" ]]; then
+  echo "Could not determine target model type from ${TARGET_MODEL}/config.json" >&2
+  exit 1
+fi
+if [[ -z "${DRAFT_MODEL_TYPE}" ]]; then
+  echo "Could not determine draft model type from ${DRAFT_MODEL}/config.json" >&2
+  exit 1
+fi
+if [[ "${SSD_DRAFT_BACKEND}" == "auto" ]]; then
+  case "${DRAFT_MODEL_TYPE}" in
+    qwen3|llama)
+      SSD_DRAFT_BACKEND=official
+      ;;
+    *)
+      SSD_DRAFT_BACKEND=sglang
+      ;;
+  esac
+fi
 if [[ "${SSD_DRAFT_BACKEND}" != "official" && "${SSD_DRAFT_BACKEND}" != "sglang" ]]; then
-  echo "SSD_DRAFT_BACKEND must be either official or sglang." >&2
+  echo "SSD_DRAFT_BACKEND must be auto, official, or sglang." >&2
+  exit 1
+fi
+if [[ "${SSD_DRAFT_BACKEND}" == "official" && "${DRAFT_MODEL_TYPE}" == qwen3_5* ]]; then
+  echo "The official SSD DraftRunner has no Qwen3.5 Gated DeltaNet implementation." >&2
+  echo "Use SSD_DRAFT_BACKEND=sglang, or leave it as auto." >&2
   exit 1
 fi
 SSD_VERIFY_TOKENS=$((SSD_DRAFT_LENGTH + 1))
 if [[ -z "${DRAFT_CONTINUOUS_DECODE_STEPS}" ]]; then
-  DRAFT_CONTINUOUS_DECODE_STEPS="${SSD_VERIFY_TOKENS}"
+  if [[ "${DRAFT_MODEL_TYPE}" == qwen3_5* ]]; then
+    # Hybrid GDN uses request-scoped recurrent state with the no-buffer
+    # scheduler. Re-entering a branch batch for K+1 continuous decode steps
+    # can reuse stale state indices; one scheduler step keeps ownership clear.
+    DRAFT_CONTINUOUS_DECODE_STEPS=1
+  else
+    DRAFT_CONTINUOUS_DECODE_STEPS="${SSD_VERIFY_TOKENS}"
+  fi
 fi
 
 if [[ -s "${RUN_DIR}/target.pid" || -s "${RUN_DIR}/draft.pid" ]]; then
@@ -101,8 +146,11 @@ export SGLANG_SSD_DISABLE_OUTCOME_CACHE="${SSD_DISABLE_OUTCOME_CACHE}"
 
 TARGET_DETERMINISTIC_ARGS=()
 TARGET_PRECISION_ARGS=()
+TARGET_SGLANG_ENV=()
+TARGET_SCHEDULER_ARGS=()
 DRAFT_DETERMINISTIC_ARGS=()
 DRAFT_TOKENIZER_ARGS=()
+DRAFT_SGLANG_ENV=()
 DRAFT_SCHEDULER_ARGS=(
   --num-continuous-decode-steps "${DRAFT_CONTINUOUS_DECODE_STEPS}"
 )
@@ -112,6 +160,13 @@ SSD_BRANCH_BATCH=$((SSD_VERIFY_TOKENS * SSD_FAN_OUT))
 if [[ "${TARGET_DETERMINISTIC_INFERENCE}" == "1" ]]; then
   TARGET_DETERMINISTIC_ARGS+=(--enable-deterministic-inference)
 fi
+if [[ "${TARGET_MODEL_TYPE}" == qwen3_5* ]]; then
+  TARGET_SGLANG_ENV+=("SGLANG_DISABLE_CUDNN_CHECK=1")
+  # SGLang classifies Qwen3.5 as a conditional-generation/VLM model and its
+  # built-in warmup injects an image. SSD forwards that multimodal token prefix
+  # to the text-only draft model, where it is not a valid draft request.
+  TARGET_SCHEDULER_ARGS+=(--skip-server-warmup)
+fi
 if [[ -n "${TARGET_FP8_GEMM_BACKEND}" ]]; then
   TARGET_PRECISION_ARGS+=(--fp8-gemm-backend "${TARGET_FP8_GEMM_BACKEND}")
 fi
@@ -120,6 +175,12 @@ if [[ "${DRAFT_DETERMINISTIC_INFERENCE}" == "1" ]]; then
 fi
 if [[ "${DRAFT_SKIP_TOKENIZER_INIT}" == "1" ]]; then
   DRAFT_TOKENIZER_ARGS+=(--skip-tokenizer-init)
+fi
+if [[ "${DRAFT_MODEL_TYPE}" == qwen3_5* ]]; then
+  # This environment has torch 2.9.1 with cuDNN 9.10. The guarded Conv3d path
+  # is not executed because the SSD drafter submits text-only requests, but
+  # SGLang checks the multimodal wrapper type before serving starts.
+  DRAFT_SGLANG_ENV+=("SGLANG_DISABLE_CUDNN_CHECK=1")
 fi
 if [[ "${DRAFT_DISABLE_OVERLAP_SCHEDULE}" == "1" ]]; then
   DRAFT_SCHEDULER_ARGS+=(--disable-overlap-schedule)
@@ -194,7 +255,11 @@ trap stop_started_processes ERR INT TERM
 wait_until_ready() {
   local port=$1 pid=$2 log=$3 attempts=$4
   for _ in $(seq 1 "${attempts}"); do
-    if curl -fsS "http://127.0.0.1:${port}/model_info" >/dev/null 2>&1; then
+    # /model_info becomes available before SGLang's asynchronous warmup ends,
+    # while /health can inject a one-token generation request. Wait for the
+    # explicit warmup-complete marker, then use the read-only endpoint.
+    if grep -qF "The server is fired up and ready to roll!" "${log}" \
+      && curl -fsS "http://127.0.0.1:${port}/model_info" >/dev/null 2>&1; then
       return 0
     fi
     if ! kill -0 "${pid}" 2>/dev/null; then
@@ -250,12 +315,12 @@ if [[ "${SSD_DRAFT_BACKEND}" == "official" ]]; then
       >"${DRAFT_LOG}" 2>&1 < /dev/null &
   SSD_DRAFT_SERVER_URL="unix://${SSD_DRAFT_SOCKET}"
 else
-  env "${DRAFT_MPS_ENV[@]}" \
+  env "${DRAFT_MPS_ENV[@]}" "${DRAFT_SGLANG_ENV[@]}" \
     SSD_PHASE_NVTX="$([[ -n "${NSYS_PROFILE_PREFIX}" ]] && echo 1 || echo 0)" \
     SSD_PROFILE_ROLE=draft PYTHONPATH="${DRAFT_PYTHONPATH}" setsid \
     "${DRAFT_PROFILE_PREFIX[@]}" python -m sglang.launch_server \
       --host 127.0.0.1 --port "${DRAFT_PORT}" \
-      --model "${DRAFT_MODEL}" --served-model-name Qwen3-0.6B-SSD \
+      --model "${DRAFT_MODEL}" --served-model-name "${DRAFT_SERVED_MODEL_NAME}" \
       --tensor-parallel-size 1 --attention-backend triton \
       --max-total-tokens 16384 --max-running-requests "${DRAFT_MAX_RUNNING_REQUESTS}" \
       --chunked-prefill-size 2048 --mem-fraction-static 0.20 \
@@ -286,7 +351,7 @@ TARGET_MPS_ENV=(
 if [[ -n "${TARGET_MPS_CLIENT_PRIORITY}" ]]; then
   TARGET_MPS_ENV+=("CUDA_MPS_CLIENT_PRIORITY=${TARGET_MPS_CLIENT_PRIORITY}")
 fi
-env "${TARGET_MPS_ENV[@]}" setsid \
+env "${TARGET_MPS_ENV[@]}" "${TARGET_SGLANG_ENV[@]}" setsid \
   "${TARGET_PROFILE_PREFIX[@]}" python -m sglang.launch_server \
     --host 127.0.0.1 --port "${TARGET_PORT}" \
     --model "${TARGET_MODEL}" --served-model-name "${TARGET_SERVED_MODEL_NAME}" \
@@ -300,6 +365,7 @@ env "${TARGET_MPS_ENV[@]}" setsid \
     --watchdog-timeout 3000 --disable-shared-experts-fusion \
     --trust-remote-code --enable-p2p-check --disable-custom-all-reduce \
     "${TARGET_DETERMINISTIC_ARGS[@]}" "${TARGET_PRECISION_ARGS[@]}" \
+    "${TARGET_SCHEDULER_ARGS[@]}" \
     --reasoning-parser qwen3 --cuda-graph-max-bs 1 --cuda-graph-bs 1 \
     --speculative-algorithm SSD \
     --speculative-num-steps "${SSD_DRAFT_LENGTH}" --speculative-eagle-topk 1 \
@@ -315,6 +381,6 @@ wait_until_ready \
 trap - ERR INT TERM
 echo "SSD ready on GPU ${GPU_ID}: target=http://127.0.0.1:${TARGET_PORT} (${TARGET_MPS_PERCENT}%), draft=${SSD_DRAFT_SERVER_URL} (${DRAFT_MPS_PERCENT}%)"
 echo "MPS client priority: target=${TARGET_MPS_CLIENT_PRIORITY:-default}, draft=${DRAFT_MPS_CLIENT_PRIORITY:-default}"
-echo "SSD config: backend=${SSD_DRAFT_BACKEND}, K=${SSD_DRAFT_LENGTH}, fan_outs=${SSD_FAN_OUT_VALUES[*]}, verify_tokens=${SSD_VERIFY_TOKENS}, branch_batch=${SSD_BRANCH_BATCH}"
+echo "SSD config: backend=${SSD_DRAFT_BACKEND}, target_model_type=${TARGET_MODEL_TYPE}, draft_model_type=${DRAFT_MODEL_TYPE}, K=${SSD_DRAFT_LENGTH}, fan_outs=${SSD_FAN_OUT_VALUES[*]}, verify_tokens=${SSD_VERIFY_TOKENS}, branch_batch=${SSD_BRANCH_BATCH}"
 echo "SSD outcome cache: $([[ "${SSD_DISABLE_OUTCOME_CACHE}" == "1" ]] && echo disabled || echo enabled)"
 echo "Logs: ${LOG_DIR}"
