@@ -19,10 +19,10 @@ Usage:
 from __future__ import annotations
 
 import torch
-from typing import List, Optional, Union
+from typing import List, Optional
 
 # Import base infrastructure for inference
-from .experts_base import BaseMoEWrapper, KExpertsCPUBuffer
+from .experts_base import BaseMoEWrapper
 
 # Import inference backend implementations
 from .utils.amx import AMXMoEWrapper, NativeMoEWrapper
@@ -51,6 +51,8 @@ INFERENCE_METHODS = frozenset(
 SFT_METHODS = frozenset(
     [
         "AMXBF16_SFT",  # AMX BF16 training
+        "AMXFP8_SFT",  # Block-wise E4M3 routed-expert LoRA training
+        "INT8_SFT",  # Hardware-neutral INT8 training (AMX or AVX512-VNNI)
         "AMXINT8_SFT",  # AMX INT8 training
         "AMXINT4_SFT",  # AMX INT4 training
         "AMXINT4_1_SFT",  # AMX INT4_1 training
@@ -140,10 +142,13 @@ class KTMoEWrapper:
         num_gpu_experts: int = 0,
         lora_rank: int = 16,
         lora_alpha: float = 32.0,
+        lora_dropout: float = 0.0,
         max_cache_depth: int = 1,
         # Quantization config (for K-Group SFT methods)
         group_size: int = 128,
         zero_point: bool = True,
+        # Full weight gradient mode (for full fine-tuning without LoRA)
+        full_weight_grad: bool = False,
         # V4-Flash 2604B SwiGLU clamp limit. 0.0 = disabled (default for
         # every dtype except DSV4-2604B routed experts, which set this to
         # 10.0 to match trtllm gemm1_clamp_limit / deep_gemm
@@ -249,9 +254,11 @@ class KTMoEWrapper:
                 method=method,
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
+                lora_dropout=lora_dropout,
                 max_cache_depth=max_cache_depth,
                 group_size=group_size,
                 zero_point=zero_point,
+                full_weight_grad=full_weight_grad,
             )
 
     # Forward static methods to the base class
@@ -407,9 +414,11 @@ def _create_sft_wrapper(
     method: str,
     lora_rank: int,
     lora_alpha: float,
+    lora_dropout: float,
     max_cache_depth: int,
     group_size: int,
     zero_point: bool,
+    full_weight_grad: bool = False,
 ):
     """
     Create an SFT wrapper based on the method.
@@ -436,8 +445,10 @@ def _create_sft_wrapper(
         chunked_prefill_size=chunked_prefill_size,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
         max_cache_depth=max_cache_depth,
         method=method,
         group_size=group_size,
         zero_point=zero_point,
+        full_weight_grad=full_weight_grad,
     )

@@ -11,7 +11,7 @@
 [submodule "third_party/sglang"]
 	path = third_party/sglang
 	url = git@github.com:q2727/sglang.git
-	branch = MaaS-exp
+	branch = ssd-moe-offload
 [submodule "third_party/ssd"]
 	path = third_party/ssd
 	url = https://github.com/tanishqkumar/ssd.git
