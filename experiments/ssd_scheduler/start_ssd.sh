@@ -12,6 +12,9 @@ TARGET_FP8_GEMM_BACKEND="${TARGET_FP8_GEMM_BACKEND:-}"
 TARGET_MEM_FRACTION_STATIC="${TARGET_MEM_FRACTION_STATIC:-0.65}"
 TARGET_MAX_TOTAL_TOKENS="${TARGET_MAX_TOTAL_TOKENS:-32768}"
 TARGET_CHUNKED_PREFILL_SIZE="${TARGET_CHUNKED_PREFILL_SIZE:-2048}"
+TARGET_CPU_WORKERS="${TARGET_CPU_WORKERS:-120}"
+TARGET_THREADPOOL_COUNT="${TARGET_THREADPOOL_COUNT:-2}"
+TARGET_NUMA_NODES="${TARGET_NUMA_NODES:-0 1}"
 TARGET_READY_TIMEOUT="${TARGET_READY_TIMEOUT:-180}"
 DRAFT_READY_TIMEOUT="${DRAFT_READY_TIMEOUT:-300}"
 TARGET_PORT="${TARGET_PORT:-30020}"
@@ -30,6 +33,7 @@ TARGET_MPS_PERCENT="${TARGET_MPS_PERCENT:-82}"
 DRAFT_MPS_PERCENT="${DRAFT_MPS_PERCENT:-18}"
 TARGET_MPS_CLIENT_PRIORITY="${TARGET_MPS_CLIENT_PRIORITY:-}"
 DRAFT_MPS_CLIENT_PRIORITY="${DRAFT_MPS_CLIENT_PRIORITY:-}"
+SSD_USE_MPS="${SSD_USE_MPS:-auto}"
 TARGET_DETERMINISTIC_INFERENCE="${TARGET_DETERMINISTIC_INFERENCE:-1}"
 DRAFT_DETERMINISTIC_INFERENCE="${DRAFT_DETERMINISTIC_INFERENCE:-0}"
 SSD_DRAFT_LENGTH="${SSD_DRAFT_LENGTH:-8}"
@@ -47,8 +51,8 @@ RUN_DIR="${OUT_DIR}/run"
 LOG_DIR="${OUT_DIR}/logs"
 SSD_DRAFT_SOCKET="${SSD_DRAFT_SOCKET:-/tmp/ktransformers-ssd-${USER}-gpu${GPU_ID}.sock}"
 
-MPS_PIPE_DIR="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/qinchong-mps-gpu${GPU_ID}-pipe}"
-MPS_LOG_DIR="${CUDA_MPS_LOG_DIRECTORY:-/tmp/qinchong-mps-gpu${GPU_ID}-log}"
+MPS_PIPE_DIR="${CUDA_MPS_PIPE_DIRECTORY:-/tmp/${USER}-mps-gpu${GPU_ID}-pipe}"
+MPS_LOG_DIR="${CUDA_MPS_LOG_DIRECTORY:-/tmp/${USER}-mps-gpu${GPU_ID}-log}"
 
 mkdir -p "${RUN_DIR}" "${LOG_DIR}"
 
@@ -97,6 +101,22 @@ if [[ "${SSD_DRAFT_BACKEND}" == "official" && "${DRAFT_MODEL_TYPE}" == qwen3_5* 
   echo "Use SSD_DRAFT_BACKEND=sglang, or leave it as auto." >&2
   exit 1
 fi
+if [[ "${SSD_USE_MPS}" == "auto" ]]; then
+  if command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
+    SSD_USE_MPS=1
+  else
+    SSD_USE_MPS=0
+  fi
+fi
+if [[ "${SSD_USE_MPS}" != "0" && "${SSD_USE_MPS}" != "1" ]]; then
+  echo "SSD_USE_MPS must be auto, 0, or 1." >&2
+  exit 1
+fi
+if [[ "${SSD_USE_MPS}" == "1" ]] \
+  && ! command -v nvidia-cuda-mps-control >/dev/null 2>&1; then
+  echo "SSD_USE_MPS=1, but nvidia-cuda-mps-control is unavailable." >&2
+  exit 1
+fi
 SSD_VERIFY_TOKENS=$((SSD_DRAFT_LENGTH + 1))
 if [[ -z "${DRAFT_CONTINUOUS_DECODE_STEPS}" ]]; then
   if [[ "${DRAFT_MODEL_TYPE}" == qwen3_5* ]]; then
@@ -133,13 +153,11 @@ export CUDA_HOME="${CUDA_HOME:-/usr/local/cuda-12.8}"
 export PATH="${CUDA_HOME}/bin:${PATH}"
 export LD_LIBRARY_PATH="${CUDA_HOME}/lib64:${LD_LIBRARY_PATH:-}"
 export CUDA_VISIBLE_DEVICES="${GPU_ID}"
-export CUDA_MPS_PIPE_DIRECTORY="${MPS_PIPE_DIR}"
-export CUDA_MPS_LOG_DIRECTORY="${MPS_LOG_DIR}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export SSD_HF_CACHE="${SSD_HF_CACHE:-${HOME}/.cache/huggingface}"
 export SSD_DATASET_DIR="${SSD_DATASET_DIR:-${SSD_OFFICIAL_ROOT}/data}"
-export SSD_CUDA_ARCH="${SSD_CUDA_ARCH:-8.9}"
+export SSD_CUDA_ARCH="${SSD_CUDA_ARCH:-$(nvidia-smi -i "${GPU_ID}" --query-gpu=compute_cap --format=csv,noheader,nounits | tr -d '[:space:]')}"
 export SGLANG_ENABLE_COLOCATED_BATCH_GEN=1
 export SGLANG_SSD_DRAFT_SIDE_CACHE="${SSD_DRAFT_SIDE_CACHE}"
 export SGLANG_SSD_DISABLE_OUTCOME_CACHE="${SSD_DISABLE_OUTCOME_CACHE}"
@@ -230,13 +248,16 @@ if [[ -n "${NSYS_PROFILE_PREFIX}" ]]; then
   DRAFT_PYTHONPATH="${REPO_ROOT}/experiments/ssd_sm_profile/hook:${DRAFT_PYTHONPATH}"
 fi
 
-rm -rf "${MPS_PIPE_DIR}" "${MPS_LOG_DIR}"
-mkdir -p "${MPS_PIPE_DIR}" "${MPS_LOG_DIR}"
-nvidia-cuda-mps-control -d
+if [[ "${SSD_USE_MPS}" == "1" ]]; then
+  export CUDA_MPS_PIPE_DIRECTORY="${MPS_PIPE_DIR}"
+  export CUDA_MPS_LOG_DIRECTORY="${MPS_LOG_DIR}"
+  rm -rf "${MPS_PIPE_DIR}" "${MPS_LOG_DIR}"
+  mkdir -p "${MPS_PIPE_DIR}" "${MPS_LOG_DIR}"
+  nvidia-cuda-mps-control -d
 
-# The MPS server remaps the single physical GPU selected above to logical
-# device 0.  Clients must use that remapped ordinal when GPU_ID is nonzero.
-export CUDA_VISIBLE_DEVICES=0
+  # The MPS server remaps the selected physical GPU to logical device 0.
+  export CUDA_VISIBLE_DEVICES=0
+fi
 
 stop_started_processes() {
   local pid
@@ -248,7 +269,9 @@ stop_started_processes() {
     rm -f "${RUN_DIR}/${name}.pid"
   done
   rm -f "${SSD_DRAFT_SOCKET}"
-  echo quit | nvidia-cuda-mps-control >/dev/null 2>&1 || true
+  if [[ "${SSD_USE_MPS}" == "1" ]]; then
+    echo quit | nvidia-cuda-mps-control >/dev/null 2>&1 || true
+  fi
 }
 trap stop_started_processes ERR INT TERM
 
@@ -289,10 +312,11 @@ wait_until_socket_ready() {
 }
 
 DRAFT_LOG="${LOG_DIR}/draft.log"
-DRAFT_MPS_ENV=(
-  "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${DRAFT_MPS_PERCENT}"
-)
-if [[ -n "${DRAFT_MPS_CLIENT_PRIORITY}" ]]; then
+DRAFT_MPS_ENV=()
+if [[ "${SSD_USE_MPS}" == "1" ]]; then
+  DRAFT_MPS_ENV+=("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${DRAFT_MPS_PERCENT}")
+fi
+if [[ "${SSD_USE_MPS}" == "1" && -n "${DRAFT_MPS_CLIENT_PRIORITY}" ]]; then
   DRAFT_MPS_ENV+=("CUDA_MPS_CLIENT_PRIORITY=${DRAFT_MPS_CLIENT_PRIORITY}")
 fi
 if [[ "${SSD_DRAFT_BACKEND}" == "official" ]]; then
@@ -345,19 +369,26 @@ else
 fi
 
 TARGET_LOG="${LOG_DIR}/target.log"
-TARGET_MPS_ENV=(
-  "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${TARGET_MPS_PERCENT}"
-)
-if [[ -n "${TARGET_MPS_CLIENT_PRIORITY}" ]]; then
+TARGET_MPS_ENV=()
+if [[ "${SSD_USE_MPS}" == "1" ]]; then
+  TARGET_MPS_ENV+=("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE=${TARGET_MPS_PERCENT}")
+fi
+if [[ "${SSD_USE_MPS}" == "1" && -n "${TARGET_MPS_CLIENT_PRIORITY}" ]]; then
   TARGET_MPS_ENV+=("CUDA_MPS_CLIENT_PRIORITY=${TARGET_MPS_CLIENT_PRIORITY}")
+fi
+TARGET_NUMA_ARGS=()
+if [[ -n "${TARGET_NUMA_NODES}" ]]; then
+  read -r -a TARGET_NUMA_NODE_VALUES <<<"${TARGET_NUMA_NODES}"
+  TARGET_NUMA_ARGS+=(--kt-numa-nodes "${TARGET_NUMA_NODE_VALUES[@]}")
 fi
 env "${TARGET_MPS_ENV[@]}" "${TARGET_SGLANG_ENV[@]}" setsid \
   "${TARGET_PROFILE_PREFIX[@]}" python -m sglang.launch_server \
     --host 127.0.0.1 --port "${TARGET_PORT}" \
     --model "${TARGET_MODEL}" --served-model-name "${TARGET_SERVED_MODEL_NAME}" \
     --kt-weight-path "${TARGET_MODEL}" --kt-method "${TARGET_KT_METHOD}" \
-    --kt-num-gpu-experts 0 --kt-cpuinfer 120 --kt-threadpool-count 2 \
-    --kt-numa-nodes 0 1 --kt-gpu-prefill-token-threshold 2048 \
+    --kt-num-gpu-experts 0 --kt-cpuinfer "${TARGET_CPU_WORKERS}" \
+    --kt-threadpool-count "${TARGET_THREADPOOL_COUNT}" \
+    "${TARGET_NUMA_ARGS[@]}" --kt-gpu-prefill-token-threshold 2048 \
     --tensor-parallel-size 1 --attention-backend triton \
     --max-total-tokens "${TARGET_MAX_TOTAL_TOKENS}" --max-running-requests 2 \
     --chunked-prefill-size "${TARGET_CHUNKED_PREFILL_SIZE}" \
@@ -379,8 +410,14 @@ wait_until_ready \
   "${TARGET_PORT}" "${TARGET_PID}" "${TARGET_LOG}" "${TARGET_READY_TIMEOUT}"
 
 trap - ERR INT TERM
-echo "SSD ready on GPU ${GPU_ID}: target=http://127.0.0.1:${TARGET_PORT} (${TARGET_MPS_PERCENT}%), draft=${SSD_DRAFT_SERVER_URL} (${DRAFT_MPS_PERCENT}%)"
-echo "MPS client priority: target=${TARGET_MPS_CLIENT_PRIORITY:-default}, draft=${DRAFT_MPS_CLIENT_PRIORITY:-default}"
+if [[ "${SSD_USE_MPS}" == "1" ]]; then
+  echo "SSD ready on GPU ${GPU_ID}: target=http://127.0.0.1:${TARGET_PORT} (${TARGET_MPS_PERCENT}%), draft=${SSD_DRAFT_SERVER_URL} (${DRAFT_MPS_PERCENT}%)"
+  echo "MPS client priority: target=${TARGET_MPS_CLIENT_PRIORITY:-default}, draft=${DRAFT_MPS_CLIENT_PRIORITY:-default}"
+else
+  echo "SSD ready without MPS on GPU ${GPU_ID}: target=http://127.0.0.1:${TARGET_PORT}, draft=${SSD_DRAFT_SERVER_URL}"
+  echo "Warning: SM quotas and cross-process spatial overlap are disabled."
+fi
+echo "KT CPU config: workers=${TARGET_CPU_WORKERS}, threadpools=${TARGET_THREADPOOL_COUNT}, numa_nodes=${TARGET_NUMA_NODES:-none}"
 echo "SSD config: backend=${SSD_DRAFT_BACKEND}, target_model_type=${TARGET_MODEL_TYPE}, draft_model_type=${DRAFT_MODEL_TYPE}, K=${SSD_DRAFT_LENGTH}, fan_outs=${SSD_FAN_OUT_VALUES[*]}, verify_tokens=${SSD_VERIFY_TOKENS}, branch_batch=${SSD_BRANCH_BATCH}"
 echo "SSD outcome cache: $([[ "${SSD_DISABLE_OUTCOME_CACHE}" == "1" ]] && echo disabled || echo enabled)"
 echo "Logs: ${LOG_DIR}"
